@@ -12,6 +12,7 @@ fn main() -> Result<()> {
     loop {
         for _ in 0..20 {
             Clipboard::write("yoyoyo")?;
+
             // thread::sleep(Duration::from_millis(1));
             // println!("\nReading");
             assert_eq!("yoyoyo", Clipboard::read()?);

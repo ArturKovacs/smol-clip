@@ -8,6 +8,7 @@ use x11rb::{
         xproto::{
             ConnectionExt as _, CreateWindowAux, EventMask, GetPropertyType, PropMode,
             SelectionNotifyEvent, Time, WindowClass, SELECTION_NOTIFY_EVENT,
+            AtomEnum,
         },
         Event,
     },
@@ -34,7 +35,10 @@ x11rb::atom_manager! {
         TARGETS,
         UTF8_STRING,
         XA_ATOM,
-        _ABOARD_SELECTION,
+
+        // This is just some random name for the property on our window, into which
+        // the clipboard owner writes the data we requested.
+        _BOOP,
     }
 }
 pub struct Clipboard {
@@ -59,11 +63,11 @@ impl Clipboard {
             1,
             1,
             0,
-            WindowClass::COPY_FROM_PARENT,
-            COPY_FROM_PARENT,
-            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         )?;
-        conn.flush()?;
+        conn.sync()?;
 
         let atoms = Atoms::new(&conn)?.reply()?;
 
@@ -76,69 +80,92 @@ impl Clipboard {
 
     pub fn read() -> Result<String> {
         let clipboard = Self::new().unwrap();
-        {
-            let cache = CB_DATA.lock().unwrap();
-            println!("Getting selection owner for {}", clipboard.atom_name(clipboard.atoms.CLIPBOARD).unwrap());
-            let owner_reply = clipboard.conn.get_selection_owner(clipboard.atoms.CLIPBOARD)?.reply()?;
-            if owner_reply.owner != 0 && owner_reply.owner == cache.src_win_id {
-                println!("Curr owner is identical to cache owner, returning");
-                return Ok(cache.data.clone());
-            }
-        }
+        // {
+        //     let cache = CB_DATA.lock().unwrap();
+        //     println!("Getting selection owner for {}", clipboard.atom_name(clipboard.atoms.CLIPBOARD).unwrap());
+        //     let owner_reply = clipboard.conn.get_selection_owner(clipboard.atoms.CLIPBOARD)?.reply()?;
+        //     if owner_reply.owner != 0 && owner_reply.owner == cache.src_win_id {
+        //         println!("Curr owner is identical to cache owner, returning");
+        //         return Ok(cache.data.clone());
+        //     }
+        // }
         // TODO: handle types other then UTF-8
         // request clipboard data
-        println!("Calling `convert_selection`: {}", clipboard.atom_name(clipboard.atoms._ABOARD_SELECTION).unwrap());
+        println!("Calling `convert_selection`: {}", clipboard.atom_name(clipboard.atoms._BOOP).unwrap());
+
+
+
+        //////////////////////////////////////////////////////////////////////
+        // THIS SHOULDN'T BE NEEDED.
+        // But if this wait is not here, then the `write` example fails at some point.
+        std::thread::park_timeout(std::time::Duration::from_millis(200));
+        //////////////////////////////////////////////////////////////////////
+
+
+
+        // clipboard.conn.sync().unwrap();
         clipboard
             .conn
             .convert_selection(
                 clipboard.win_id,
                 clipboard.atoms.CLIPBOARD,
                 clipboard.atoms.UTF8_STRING,
-                clipboard.atoms._ABOARD_SELECTION,
+                clipboard.atoms._BOOP,
                 Time::CURRENT_TIME,
             )
             .unwrap();
         println!("Finished `convert_selection`");
-        clipboard.conn.sync().unwrap();
+        // clipboard.conn.sync().unwrap();
         clipboard.conn.flush().unwrap();
-
+        // std::thread::park_timeout(std::time::Duration::from_millis(500));
         // read requested data
         loop {
-            if let Event::SelectionNotify(event) = clipboard.conn.wait_for_event().unwrap() {
-                println!("Event::SelectionNotify: {}", event.property);
-                // TODO: handle chunking
-                // check if this is what we requested
-                if event.selection == clipboard.atoms.CLIPBOARD {
-                    //println!("{}", clipboard.atom_name(event.property).unwrap());
-                    let reply = clipboard
-                        .conn
-                        .get_property(
-                            true,
-                            event.requestor,
-                            event.property,
-                            event.target,
-                            0,
-                            0x1fffffff,
-                        )
-                        .unwrap()
-                        .reply();
-                    if let Ok(reply) = reply {
-                        println!("Property.type: {}", clipboard.atom_name(reply.type_).unwrap());
-                        clipboard.conn.sync().unwrap();
-                        clipboard.conn.flush().unwrap();
-    
-                        // we found something
-                        if reply.type_ == clipboard.atoms.UTF8_STRING {
-                            break Ok(String::from_utf8(reply.value).unwrap());
-                        }
-                    } else { 
-                        println!("reply was Err: {:?}", reply);
-                    }
-                } else {
-                    println!("not what we were looking for")
-                }
+            // std::thread::park_timeout(Duration::from_millis(2));
+            let event = if let Some(event) = clipboard.conn.poll_for_event().unwrap() {
+                event
             } else {
-                println!("not the event that we wanted")
+                continue;
+            };
+            match event {
+                Event::SelectionNotify(event) => {
+                    println!("Event::SelectionNotify: {}, {}, {}", event.selection, event.target, event.property);
+                    // TODO: handle chunking
+                    // check if this is what we requested
+                    if event.selection == clipboard.atoms.CLIPBOARD {
+                        //println!("{}", clipboard.atom_name(event.property).unwrap());
+                        let reply = clipboard
+                            .conn
+                            .get_property(
+                                true,
+                                event.requestor,
+                                event.property,
+                                AtomEnum::ANY,
+                                0,
+                                0x1fffffff,
+                            )
+                            .unwrap()
+                            .reply();
+                        clipboard.conn.flush().unwrap();
+                        if let Ok(reply) = reply {
+                            println!("Property.type: {}", clipboard.atom_name(reply.type_).unwrap());
+                            clipboard.conn.sync().unwrap();
+                            clipboard.conn.flush().unwrap();
+        
+                            // we found something
+                            if reply.type_ == clipboard.atoms.UTF8_STRING {
+                                break Ok(String::from_utf8(reply.value).unwrap());
+                            }
+                        } else { 
+                            println!("reply was Err: {:?}", reply);
+                        }
+                    } else {
+                        println!("not what we were looking for")
+                    }
+                }
+                Event::PropertyNotify(event) => {
+                    println!("PropertyNotify: {}", event.atom);
+                }
+                _ => println!("not the event that we wanted"),
             }
         }
     }
@@ -243,13 +270,13 @@ impl Clipboard {
         clipboard.conn.flush()?;
         clipboard.conn.sync()?;
 
-        clipboard.conn.delete_property(clipboard.win_id, clipboard.atoms._ABOARD_SELECTION)?;
+        clipboard.conn.delete_property(clipboard.win_id, clipboard.atoms._BOOP)?;
         println!("Asking the clipboard manager to request the data.");
         clipboard.conn.convert_selection(
             clipboard.win_id,
             clipboard.atoms.CLIPBOARD_MANAGER,
             clipboard.atoms.SAVE_TARGETS,
-            clipboard.atoms._ABOARD_SELECTION,
+            clipboard.atoms._BOOP,
             Time::CURRENT_TIME,
         )?;
         clipboard.conn.flush()?;
@@ -274,6 +301,12 @@ impl Clipboard {
                 message,
             )?;
         }
+    }
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        self.conn.destroy_window(self.win_id).unwrap();
     }
 }
 
