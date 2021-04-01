@@ -1,27 +1,25 @@
 use arboard::Error;
 use log::{error, trace, warn};
-use once_cell::sync::{Lazy, OnceCell};
-use parking_lot::{Mutex, RwLock};
+use once_cell::sync::Lazy;
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, WaitTimeoutResult,
+        Arc,
     },
     thread::JoinHandle,
     time::Duration,
 };
-use thiserror::Error;
 use x11rb::{
     connection::Connection,
     protocol::{
         xproto::{
-            AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GetPropertyType, PropMode,
-            Screen, SelectionNotifyEvent, SelectionRequestEvent, Time, WindowClass,
-            SELECTION_NOTIFY_EVENT,
+            AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
+            SelectionNotifyEvent, SelectionRequestEvent, Time, WindowClass, SELECTION_NOTIFY_EVENT,
         },
         Event,
     },
-    rust_connection::{ConnectError, ConnectionError, ReplyError, ReplyOrIdError, RustConnection},
+    rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE,
 };
@@ -165,8 +163,8 @@ impl ClipboardContext {
         let reader = XContext::new()?;
 
         trace!(
-            "Calling `convert_selection` on: {}",
-            self.atom_name(self.atoms._BOOP).unwrap()
+            "Calling `convert_selection` on: {:?}",
+            self.atom_name(self.atoms._BOOP)
         );
 
         // request to convert the clipboard selection to our data type(s)
@@ -196,8 +194,7 @@ impl ClipboardContext {
                     );
 
                     // selection has no type = no selection present
-                    let none: u32 = AtomEnum::NONE.into();
-                    if event.property == none {
+                    if event.property == NONE {
                         return Ok(None);
                     }
 
@@ -271,32 +268,35 @@ impl ClipboardContext {
     }
 
     fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<()> {
-        println!(
-            "SelectionRequest: '{}'",
-            self.atom_name(event.target).unwrap()
-        );
+        println!("SelectionRequest: '{:?}'", self.atom_name(event.target));
         let success;
         if event.target == self.atoms.TARGETS && event.selection == self.atoms.CLIPBOARD {
             println!("property is {}", self.atom_name(event.property)?);
-            self.server.conn.change_property32(
-                PropMode::REPLACE,
-                event.requestor,
-                event.property,
-                self.atoms.ATOM,
-                &[self.atoms.TARGETS, self.atoms.UTF8_STRING],
-            )?;
-            success = true;
-        } else if event.target == self.atoms.UTF8_STRING {
-            println!("writing to target {}", self.atom_name(event.property)?);
-            let data = self.data.read().unwrap();
-            if let Some(string) = &*data {
-                self.server.conn.change_property8(
+            self.server
+                .conn
+                .change_property32(
                     PropMode::REPLACE,
                     event.requestor,
                     event.property,
-                    event.target,
-                    string.as_bytes(),
-                )?;
+                    self.atoms.ATOM,
+                    &[self.atoms.TARGETS, self.atoms.UTF8_STRING],
+                )
+                .map_err(into_unknown)?;
+            success = true;
+        } else if event.target == self.atoms.UTF8_STRING {
+            println!("writing to target {}", self.atom_name(event.property)?);
+            let data = self.data.read();
+            if let Some(string) = &*data {
+                self.server
+                    .conn
+                    .change_property8(
+                        PropMode::REPLACE,
+                        event.requestor,
+                        event.property,
+                        event.target,
+                        string.as_bytes(),
+                    )
+                    .map_err(into_unknown)?;
                 success = true;
             } else {
                 // This must mean that we lost ownership of the data
@@ -309,29 +309,32 @@ impl ClipboardContext {
             return Ok(());
         }
 
-        self.server.conn.flush()?;
+        self.server.conn.flush().map_err(into_unknown)?;
 
         let property: u32 = if success {
             event.property
         } else {
             AtomEnum::NONE.into()
         };
-        self.server.conn.send_event(
-            false,
-            event.requestor,
-            EventMask::NO_EVENT,
-            SelectionNotifyEvent {
-                response_type: SELECTION_NOTIFY_EVENT,
-                sequence: event.sequence,
-                time: event.time,
-                requestor: event.requestor,
-                selection: event.selection,
-                target: event.target,
-                property: property,
-            },
-        )?;
+        self.server
+            .conn
+            .send_event(
+                false,
+                event.requestor,
+                EventMask::NO_EVENT,
+                SelectionNotifyEvent {
+                    response_type: SELECTION_NOTIFY_EVENT,
+                    sequence: event.sequence,
+                    time: event.time,
+                    requestor: event.requestor,
+                    selection: event.selection,
+                    target: event.target,
+                    property,
+                },
+            )
+            .map_err(into_unknown)?;
 
-        self.server.conn.flush()?;
+        self.server.conn.flush().map_err(into_unknown)?;
 
         if event.target == self.atoms.UTF8_STRING {
             println!("successfully written!");
@@ -346,15 +349,17 @@ impl ClipboardContext {
             error!("The server's window id was 0. This is unexpected");
             return Ok(());
         }
-        if self.data.read().unwrap().is_none() {
+        if self.data.read().is_none() {
             // If we don't have any data, there's nothing to do.
             return Ok(());
         }
         let sel_owner = self
             .server
             .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?;
+            .get_selection_owner(self.atoms.CLIPBOARD)
+            .map_err(into_unknown)?
+            .reply()
+            .map_err(into_unknown)?;
         if sel_owner.owner != self.server.win_id {
             // We are not owning the clipboard, nothing to do.
             return Ok(());
@@ -363,17 +368,20 @@ impl ClipboardContext {
         // It's important that we lock the state before sending the request
         // because we don't want the request server thread to lock the state
         // after the request but before we can lock it here.
-        let mut handover_state = self.handover_state.lock().unwrap();
+        let mut handover_state = self.handover_state.lock();
 
         println!("Sending the data to the clipboard manager");
-        self.server.conn.convert_selection(
-            self.server.win_id,
-            self.atoms.CLIPBOARD_MANAGER,
-            self.atoms.SAVE_TARGETS,
-            self.atoms._BOOP,
-            Time::CURRENT_TIME,
-        )?;
-        self.server.conn.flush()?;
+        self.server
+            .conn
+            .convert_selection(
+                self.server.win_id,
+                self.atoms.CLIPBOARD_MANAGER,
+                self.atoms.SAVE_TARGETS,
+                self.atoms._BOOP,
+                Time::CURRENT_TIME,
+            )
+            .map_err(into_unknown)?;
+        self.server.conn.flush().map_err(into_unknown)?;
 
         *handover_state = ManagerHandoverState::InProgress;
         let handover_start = std::time::Instant::now();
@@ -393,26 +401,18 @@ impl ClipboardContext {
                 // start of the loop.
                 timed_out!();
             }
-            match self
+            let result = self
                 .handover_cv
-                .wait_timeout(handover_state, handover_max_duration)
-            {
-                Ok((new_guard, status)) => {
-                    if *new_guard == ManagerHandoverState::Finished {
-                        return Ok(());
-                    }
-                    if status.timed_out() {
-                        timed_out!();
-                    }
-                    handover_state = new_guard;
-                }
-                Err(e) => {
-                    panic!("Clipboard: The server thread paniced while having the `handover_state` locked. Error: {}", e);
-                }
+                .wait_for(&mut handover_state, handover_max_duration);
+
+            if result.timed_out() {
+                timed_out!();
+            }
+
+            if *handover_state == ManagerHandoverState::Finished {
+                return Ok(());
             }
         }
-
-        Ok(())
     }
 }
 
@@ -448,7 +448,7 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) {
                 // notifying us that we should delete our data now.
                 println!("`SelectionClear`");
                 if event.selection == clipboard.atoms.CLIPBOARD {
-                    let mut data = clipboard.data.write().unwrap();
+                    let mut data = clipboard.data.write();
                     *data = None;
                 }
             }
@@ -461,7 +461,7 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) {
                     );
                 } else if event.selection == clipboard.atoms.CLIPBOARD_MANAGER {
                     println!("SelectionRequest from the clipboard manager");
-                    let handover_state = clipboard.handover_state.lock().unwrap();
+                    let handover_state = clipboard.handover_state.lock();
                     if *handover_state == ManagerHandoverState::InProgress {
                         clipboard.manager_written.store(true, Ordering::Relaxed);
                         if clipboard.manager_notified.load(Ordering::Relaxed) {
@@ -481,7 +481,7 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) {
                     continue;
                 }
                 println!("SelectionNotify from the clipboard manager");
-                let handover_state = clipboard.handover_state.lock().unwrap();
+                let handover_state = clipboard.handover_state.lock();
                 if *handover_state == ManagerHandoverState::InProgress {
                     clipboard.manager_notified.store(true, Ordering::Relaxed);
 
@@ -524,7 +524,7 @@ impl Clipboard {
     }
 
     pub fn read(&self) -> Result<String> {
-        self.inner.read()
+        self.inner.read()?.ok_or(Error::ContentNotAvailable)
     }
 
     pub fn write(&self, message: String) -> Result<()> {
