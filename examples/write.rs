@@ -7,6 +7,11 @@ use anyhow::Result;
 use smol_clip::Clipboard;
 
 fn main() -> Result<()> {
+    // Test clipboard manager
+    let clipboard = Clipboard::new()?;
+    clipboard.write("Hello Clipboard manager!".into())?;
+    return Ok(());
+
     let now = Instant::now();
     let mut i = 0;
     let clipboard = Clipboard::new()?;

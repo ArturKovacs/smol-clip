@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, RwLock, WaitTimeoutResult,
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -45,6 +48,13 @@ x11rb::atom_manager! {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ManagerHandoverState {
+    Idle,
+    InProgress,
+    Finished,
+}
+
 struct GlobalClipboard {
     context: Arc<ClipboardContext>,
 
@@ -63,6 +73,10 @@ struct ClipboardContext {
     server: XContext,
     atoms: Atoms,
     data: RwLock<Option<String>>,
+    handover_state: Mutex<ManagerHandoverState>,
+    handover_cv: Condvar,
+    manager_written: AtomicBool,
+    manager_notified: AtomicBool,
 }
 
 impl XContext {
@@ -97,6 +111,10 @@ impl ClipboardContext {
             server,
             atoms,
             data: Default::default(),
+            handover_state: Mutex::new(ManagerHandoverState::Idle),
+            handover_cv: Condvar::new(),
+            manager_written: AtomicBool::new(false),
+            manager_notified: AtomicBool::new(false),
         })
     }
 
@@ -110,9 +128,10 @@ impl ClipboardContext {
         if owner.owner != server_win {
             self.server
                 .conn
-                .set_selection_owner(server_win, selection, Time::CURRENT_TIME);
+                .set_selection_owner(server_win, selection, Time::CURRENT_TIME)?;
         }
 
+        // Just setting the data, and the `serve_requests` will take care of the rest.
         let mut data = self.data.write().unwrap();
         *data = Some(message);
 
@@ -248,9 +267,8 @@ impl ClipboardContext {
             } else {
                 // This must mean that we lost ownership of the data
                 // since the other side requested the selection.
-                // Let's respond with property set to none.
+                // Let's respond with the property set to none.
                 success = false;
-                // warn!("Got a selection request but we have no data.");
             }
         } else {
             println!("THIS IS NOT SUPPOSED TO HAPPEN");
@@ -287,26 +305,103 @@ impl ClipboardContext {
 
         Ok(())
     }
+
+    fn ask_clipboard_manager_to_request_our_data(&self) -> Result<()> {
+        if self.server.win_id == 0 {
+            // This shouldn't really ever happen but let's just check.
+            error!("The server's window id was 0. This is unexpected");
+            return Ok(());
+        }
+        if self.data.read().unwrap().is_none() {
+            // If we don't have any data, there's nothing to do.
+            return Ok(());
+        }
+        let sel_owner = self
+            .server
+            .conn
+            .get_selection_owner(self.atoms.CLIPBOARD)?
+            .reply()?;
+        if sel_owner.owner != self.server.win_id {
+            // We are not owning the clipboard, nothing to do.
+            return Ok(());
+        }
+
+        // It's important that we lock the state before sending the request
+        // because we don't want the request server thread to lock the state
+        // after the request but before we can lock it here.
+        let mut handover_state = self.handover_state.lock().unwrap();
+
+        println!("Sending the data to the clipboard manager");
+        self.server.conn.convert_selection(
+            self.server.win_id,
+            self.atoms.CLIPBOARD_MANAGER,
+            self.atoms.SAVE_TARGETS,
+            self.atoms._BOOP,
+            Time::CURRENT_TIME,
+        )?;
+        self.server.conn.flush()?;
+
+        *handover_state = ManagerHandoverState::InProgress;
+        let handover_start = std::time::Instant::now();
+        let handover_max_duration = Duration::from_millis(100);
+        macro_rules! timed_out {
+            () => {
+                warn!("Could not hand the clipboard contents over to the clipboard manager. The request timed out.");
+                return Ok(());
+            }
+        }
+        loop {
+            if handover_start.elapsed() >= handover_max_duration {
+                // The `wait_timeout` method can wake up spuriously. If this always happens
+                // before reaching the timeout, the codvar never times out and the handover
+                // might never finish. This would produce an infinite loop here.
+                // To protect agains this, we check if a certain time has elapsed since the
+                // start of the loop.
+                timed_out!();
+            }
+            match self
+                .handover_cv
+                .wait_timeout(handover_state, handover_max_duration)
+            {
+                Ok((new_guard, status)) => {
+                    if *new_guard == ManagerHandoverState::Finished {
+                        return Ok(());
+                    }
+                    if status.timed_out() {
+                        timed_out!();
+                    }
+                    handover_state = new_guard;
+                }
+                Err(e) => {
+                    panic!("Clipboard: The server thread paniced while having the `handover_state` locked. Error: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn serve_requests(clipboard: Arc<ClipboardContext>) {
+    fn handover_finished(
+        clip: &Arc<ClipboardContext>,
+        mut handover_state: MutexGuard<ManagerHandoverState>,
+    ) {
+        println!("Finishing handover");
+        *handover_state = ManagerHandoverState::Finished;
+
+        // Not sure if unlocking the mutext is necessary here but better safe than sorry.
+        drop(handover_state);
+
+        clip.handover_cv.notify_all();
+    }
+
     loop {
-        if let Err(e) = clipboard.server.conn.flush() {
-            error!("Could not flush the X connection. Error: {}", e);
-        }
-        let event = match clipboard.server.conn.poll_for_event() {
+        let event = match clipboard.server.conn.wait_for_event() {
             Ok(event) => event,
             Err(e) => {
                 error!("Failed to poll event for clipboard: {}", e);
                 return;
-            }
-        };
-        let event = match event {
-            Some(e) => e,
-            None => {
-                // If there was no event, just wait a bit and then loop again.
-                std::thread::sleep(Duration::from_millis(4));
-                continue;
             }
         };
         match event {
@@ -315,7 +410,7 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) {
                 return;
             }
             Event::SelectionClear(event) => {
-                // Someone else has new content in the clipboard, so is
+                // Someone else has new content in the clipboard, so it is
                 // notifying us that we should delete our data now.
                 println!("`SelectionClear`");
                 if event.selection == clipboard.atoms.CLIPBOARD {
@@ -330,12 +425,42 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) {
                         "Received a `SelectionRequest`, but failed to handle it: {}",
                         e
                     );
+                } else if event.selection == clipboard.atoms.CLIPBOARD_MANAGER {
+                    println!("SelectionRequest from the clipboard manager");
+                    let handover_state = clipboard.handover_state.lock().unwrap();
+                    if *handover_state == ManagerHandoverState::InProgress {
+                        clipboard.manager_written.store(true, Ordering::Relaxed);
+                        if clipboard.manager_notified.load(Ordering::Relaxed) {
+                            handover_finished(&clipboard, handover_state);
+                        }
+                    }
                 }
             }
-            Event::SelectionNotify(_) => {
+            Event::SelectionNotify(event) => {
                 // We've requested the clipboard content and this is the
-                // answer.
-                warn!("Received a `SelectionNotify` in the clipboard `serve_requests` function. This is unexpected.");
+                // answer. Considering that this thread is not responsible
+                // for reading clipboard contents, this must come from
+                // the clipboard manager signaling that the data was
+                // handed over successfully.
+                if event.selection != clipboard.atoms.CLIPBOARD_MANAGER {
+                    error!("Received a `SelectionNotify` from a selection other than the CLIPBOARD_MANAGER. This is unexpected in this thread.");
+                    continue;
+                }
+                println!("SelectionNotify from the clipboard manager");
+                let handover_state = clipboard.handover_state.lock().unwrap();
+                if *handover_state == ManagerHandoverState::InProgress {
+                    clipboard.manager_notified.store(true, Ordering::Relaxed);
+
+                    // One would think that we could also finish if the property
+                    // here is set 0, because that indicates failure. However
+                    // this is not the case; for example on KDE plasma 5.18, we
+                    // immediately get a SelectionNotify with property set to 0,
+                    // but following that, we also get a valid SelectionRequest
+                    // from the clipboard manager.
+                    if clipboard.manager_written.load(Ordering::Relaxed) {
+                        handover_finished(&clipboard, handover_state);
+                    }
+                }
             }
             // We've requested the clipboard content and this is the
             // answer.
@@ -376,6 +501,12 @@ impl Clipboard {
 impl Drop for Clipboard {
     fn drop(&mut self) {
         println!("THE DROP TRAIT IS NOT YET IMPLEMENTED!");
+        if let Err(e) = self.inner.ask_clipboard_manager_to_request_our_data() {
+            error!(
+                "Could not hand the clipboard data over to the clipboard manager: {}",
+                e
+            );
+        }
         // self.conn.destroy_window(self.win_id).unwrap();
     }
 }
