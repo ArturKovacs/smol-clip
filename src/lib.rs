@@ -1,13 +1,15 @@
+use log::{error, warn};
+use once_cell::sync::{Lazy, OnceCell};
+use parking_lot::{Mutex, RwLock};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex, MutexGuard, RwLock, WaitTimeoutResult,
+        Arc, Condvar, WaitTimeoutResult,
     },
     thread::JoinHandle,
     time::Duration,
 };
-
-use anyhow::{anyhow, Result};
+use thiserror::Error;
 use x11rb::{
     connection::Connection,
     protocol::{
@@ -18,14 +20,40 @@ use x11rb::{
         },
         Event,
     },
-    rust_connection::RustConnection,
+    rust_connection::{ConnectError, ConnectionError, ReplyError, ReplyOrIdError, RustConnection},
     wrapper::ConnectionExt as _,
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE,
 };
 
-use log::{error, warn};
+type Result<T, E = Error> = std::result::Result<T, E>;
 
-use once_cell::sync::{Lazy, OnceCell};
+#[derive(Debug, Error)]
+enum Error {
+    #[error(transparent)]
+    Reply(#[from] ReplyError),
+    #[error(transparent)]
+    Connect(ConnectError),
+    #[error("Root not found")]
+    Root,
+    #[error("ID exhaustion: {0}")]
+    Id(ReplyOrIdError),
+    #[error("Failed to create a Window: {0}")]
+    Window(ConnectionError),
+    #[error("Failed to flush connection: {0}")]
+    Flush(ConnectionError),
+    #[error("Failed to create Atoms: {0}")]
+    Atom(ConnectionError),
+    #[error("Failed to query clipboard owner: {0}")]
+    GetOwner(ConnectionError),
+    #[error("Failed to become clipboard owner: {0}")]
+    SetOwner(ConnectionError),
+    #[error("Failed to convert selection: {0}")]
+    Convert(ConnectionError),
+    #[error("Failed to wait on a new event: {0}")]
+    Wait(ConnectionError),
+    #[error("Failed to get the selection on read: {0}")]
+    GetSelection(ConnectionError),
+}
 
 // This is locked in write mode ONLY when the object is created and
 // destroyed. All the rest of the time, everyone is allowed to keep a
@@ -81,10 +109,15 @@ struct ClipboardContext {
 
 impl XContext {
     fn new() -> Result<Self> {
-        let (conn, screen_num): (RustConnection, _) = RustConnection::connect(None)?;
-        let screen = &conn.setup().roots[screen_num];
-        let win_id = conn.generate_id()?;
+        // create a new connection to an X11 server
+        let (conn, screen_num): (RustConnection, _) =
+            RustConnection::connect(None).map_err(Error::Connect)?;
+        let screen = conn.setup().roots.get(screen_num).ok_or(Error::Root)?;
+        let win_id = conn.generate_id().map_err(Error::Id)?;
+
+        // create the window
         conn.create_window(
+            // copy as much as possible from the parent, because no other specific input is needed
             COPY_DEPTH_FROM_PARENT,
             win_id,
             screen.root,
@@ -93,12 +126,14 @@ impl XContext {
             1,
             1,
             0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
-        )?;
-        conn.flush()?;
+            WindowClass::COPY_FROM_PARENT,
+            COPY_FROM_PARENT,
+            // don't subscribe to any special events because we are requesting everything we need ourselves
+            &CreateWindowAux::new(),
+        )
+        .map_err(Error::Window)?;
+        conn.flush().map_err(Error::Flush)?;
+
         Ok(Self { conn, win_id })
     }
 }
@@ -106,11 +141,12 @@ impl XContext {
 impl ClipboardContext {
     fn new() -> Result<Self> {
         let server = XContext::new()?;
-        let atoms = Atoms::new(&server.conn)?.reply()?;
+        let atoms = Atoms::new(&server.conn).map_err(Error::Atom)?.reply()?;
+
         Ok(Self {
             server,
             atoms,
-            data: Default::default(),
+            data: RwLock::default(),
             handover_state: Mutex::new(ManagerHandoverState::Idle),
             handover_cv: Condvar::new(),
             manager_written: AtomicBool::new(false),
@@ -119,96 +155,88 @@ impl ClipboardContext {
     }
 
     fn write(&self, message: String) -> Result<()> {
-        println!();
-        println!("new write");
+        // only if the current owner isn't us, we try to become it
+        if !self.is_owner()? {
+            let selection = self.atoms.CLIPBOARD;
+            let server_win = self.server.win_id;
 
-        let selection = self.atoms.CLIPBOARD;
-        let server_win = self.server.win_id;
-        let owner = self.server.conn.get_selection_owner(selection)?.reply()?;
-        if owner.owner != server_win {
             self.server
                 .conn
-                .set_selection_owner(server_win, selection, Time::CURRENT_TIME)?;
+                .set_selection_owner(server_win, selection, Time::CURRENT_TIME)
+                .map_err(Error::SetOwner)?;
         }
 
         // Just setting the data, and the `serve_requests` will take care of the rest.
-        let mut data = self.data.write().unwrap();
-        *data = Some(message);
+        *self.data.write() = Some(message);
 
         Ok(())
     }
 
-    fn read(&self) -> Result<String> {
-        let cb_owner = self
-            .server
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?;
-        if cb_owner.owner == self.server.win_id {
-            let data = self.data.read().unwrap();
-            return data.clone().ok_or(anyhow!("No data available"));
+    fn read(&self) -> Result<Option<String>> {
+        // if we are the current owner, we can get the current clipboard ourselves
+        if self.is_owner()? {
+            let data = self.data.read();
+            return Ok(data.clone());
         }
         let reader = XContext::new()?;
 
-        println!(
-            "Calling `convert_selection`: {}",
+        log::info!(
+            "Calling `convert_selection` on: {}",
             self.atom_name(self.atoms._BOOP).unwrap()
         );
 
-        //////////////////////////////////////////////////////////////////////
-        // THIS SHOULDN'T BE NEEDED.
-        // But if this wait is not here, then the `write` example fails at some point.
-        // std::thread::park_timeout(std::time::Duration::from_millis(200));
-        //////////////////////////////////////////////////////////////////////
+        // request to convert the clipboard selection to our data type(s)
+        reader
+            .conn
+            .convert_selection(
+                reader.win_id,
+                self.atoms.CLIPBOARD,
+                self.atoms.UTF8_STRING,
+                self.atoms._BOOP,
+                Time::CURRENT_TIME,
+            )
+            .map_err(Error::Convert)?;
+        reader.conn.flush().map_err(Error::Flush)?;
 
-        reader.conn.convert_selection(
-            reader.win_id,
-            self.atoms.CLIPBOARD,
-            self.atoms.UTF8_STRING,
-            self.atoms._BOOP,
-            Time::CURRENT_TIME,
-        )?;
-        println!("Finished `convert_selection`");
-        // std::thread::park_timeout(std::time::Duration::from_millis(500));
-        // read requested data
+        log::info!("Finished `convert_selection`");
 
-        // Given that we use poll for event, we must flush outgoing events here.
-        // (wait for events would do this automatically, but we don't want to block)
-        reader.conn.flush()?;
         loop {
-            // std::thread::park_timeout(Duration::from_millis(2));
-            let event = if let Some(event) = reader.conn.poll_for_event().unwrap() {
-                event
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
-                continue;
-            };
-            match event {
+            match reader.conn.wait_for_event().map_err(Error::Wait)? {
+                // a selection exists
                 Event::SelectionNotify(event) => {
-                    println!(
+                    log::info!(
                         "Event::SelectionNotify: {}, {}, {}",
-                        event.selection, event.target, event.property
+                        event.selection,
+                        event.target,
+                        event.property
                     );
+
+                    // selection has no type = no selection present
                     let none: u32 = AtomEnum::NONE.into();
                     if event.property == none {
-                        return Err(anyhow!("No data available"));
+                        return Ok(None);
                     }
+
                     // TODO: handle chunking
                     // check if this is what we requested
                     if event.selection == self.atoms.CLIPBOARD {
-                        //println!("{}", self.atom_name(event.property).unwrap());
+                        // request the selection
                         let reply = reader
                             .conn
                             .get_property(
                                 true,
                                 event.requestor,
                                 event.property,
-                                AtomEnum::ANY,
+                                // request the type that arrived
+                                event.target,
                                 0,
-                                0x1fffffff,
-                            )?
-                            .reply();
-                        reader.conn.flush()?;
+                                // the length is corrected to X11 specifications by x11rb
+                                u32::MAX,
+                            )
+                            .map_err(Error::GetSelection)?
+                            .reply()?;
+                        reader.conn.flush().map_err(Error::Flush)?;
+
                         if let Ok(reply) = reply {
                             println!("Property.type: {}", self.atom_name(reply.type_).unwrap());
                             reader.conn.flush()?;
@@ -221,7 +249,7 @@ impl ClipboardContext {
                             println!("reply was Err: {:?}", reply);
                         }
                     } else {
-                        println!("not what we were looking for")
+                        log::info!("a foreign selection arrived")
                     }
                 }
                 Event::PropertyNotify(event) => {
@@ -230,6 +258,18 @@ impl ClipboardContext {
                 _ => println!("not the event that we wanted"),
             }
         }
+    }
+
+    fn is_owner(&self) -> Result<bool> {
+        let current = self
+            .server
+            .conn
+            .get_selection_owner(self.atoms.CLIPBOARD)
+            .map_err(Error::GetOwner)?
+            .reply()?
+            .owner;
+
+        Ok(current == self.server.win_id)
     }
 
     fn atom_name(&self, atom: x11rb::protocol::xproto::Atom) -> Result<String> {
