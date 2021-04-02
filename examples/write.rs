@@ -14,6 +14,7 @@ fn main() -> Result<()> {
     let clipboard = Clipboard::new()?;
     clipboard.write("Hello Clipboard manager!".into())?;
     thread::sleep(Duration::from_secs(6));
+    assert!(Clipboard::is_alive());
     assert_eq!("Hello Clipboard manager!", clipboard.read()?);
     return Ok(());
 

@@ -1,5 +1,5 @@
 use arboard::Error;
-use log::{error, trace, warn};
+use log::{error, info, trace, warn};
 use once_cell::sync::Lazy;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use std::{
@@ -86,8 +86,6 @@ struct ClipboardContext {
     data: RwLock<Option<String>>,
     handover_state: Mutex<ManagerHandoverState>,
     handover_cv: Condvar,
-    manager_written: AtomicBool,
-    manager_notified: AtomicBool,
 }
 
 impl XContext {
@@ -100,6 +98,12 @@ impl XContext {
         })?;
         let win_id = conn.generate_id().map_err(into_unknown)?;
 
+        let event_mask =
+            // Just in case that some program reports SelectionNotify events
+            // with XCB_EVENT_MASK_PROPERTY_CHANGE mask.
+            EventMask::PROPERTY_CHANGE |
+            // To receive DestroyNotify event and stop the message loop.
+            EventMask::STRUCTURE_NOTIFY;
         // create the window
         conn.create_window(
             // copy as much as possible from the parent, because no other specific input is needed
@@ -114,7 +118,7 @@ impl XContext {
             WindowClass::COPY_FROM_PARENT,
             COPY_FROM_PARENT,
             // don't subscribe to any special events because we are requesting everything we need ourselves
-            &CreateWindowAux::new(),
+            &CreateWindowAux::new().event_mask(event_mask),
         )
         .map_err(into_unknown)?;
         conn.flush().map_err(into_unknown)?;
@@ -137,8 +141,6 @@ impl ClipboardContext {
             data: RwLock::default(),
             handover_state: Mutex::new(ManagerHandoverState::Idle),
             handover_cv: Condvar::new(),
-            manager_written: AtomicBool::new(false),
-            manager_notified: AtomicBool::new(false),
         })
     }
 
@@ -152,6 +154,7 @@ impl ClipboardContext {
                 .conn
                 .set_selection_owner(server_win, selection, Time::CURRENT_TIME)
                 .map_err(|_| Error::ClipboardOccupied)?;
+            self.server.conn.flush().map_err(into_unknown)?;
         }
 
         // Just setting the data, and the `serve_requests` will take care of the rest.
@@ -277,23 +280,29 @@ impl ClipboardContext {
     }
 
     fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<()> {
-        println!("SelectionRequest: '{:?}'", self.atom_name(event.target));
+        trace!("SelectionRequest: '{:?}'", self.atom_name(event.target));
         let success;
+        // we are asked for a list of supported conversion targets
         if event.target == self.atoms.TARGETS && event.selection == self.atoms.CLIPBOARD {
-            println!("property is {}", self.atom_name(event.property)?);
+            trace!("property is {}", self.atom_name(event.property)?);
             self.server
                 .conn
                 .change_property32(
                     PropMode::REPLACE,
                     event.requestor,
                     event.property,
+                    // TODO: change to `AtomEnum::ATOM`
                     self.atoms.ATOM,
+                    // TODO: add `SAVE_TARGETS` to signal support for clipboard manager
                     &[self.atoms.TARGETS, self.atoms.UTF8_STRING],
                 )
                 .map_err(into_unknown)?;
+            self.server.conn.flush().map_err(into_unknown)?;
             success = true;
-        } else if event.target == self.atoms.UTF8_STRING {
-            println!("writing to target {}", self.atom_name(event.property)?);
+        }
+        // we are asked to send a the data in a supported UTF8 format
+        else if event.target == self.atoms.UTF8_STRING {
+            trace!("writing to target {}", self.atom_name(event.property)?);
             let data = self.data.read();
             if let Some(string) = &*data {
                 self.server
@@ -302,29 +311,32 @@ impl ClipboardContext {
                         PropMode::REPLACE,
                         event.requestor,
                         event.property,
+                        // TODO: be more precise and say `self.atoms.UTF8_STRING`, we can encapsulate this when we add more types
                         event.target,
                         string.as_bytes(),
                     )
                     .map_err(into_unknown)?;
+                self.server.conn.flush().map_err(into_unknown)?;
                 success = true;
             } else {
+                // TODO: we should still continue sending data
                 // This must mean that we lost ownership of the data
                 // since the other side requested the selection.
                 // Let's respond with the property set to none.
                 success = false;
             }
         } else {
-            println!("THIS IS NOT SUPPOSED TO HAPPEN");
+            trace!("received a foreign event");
             return Ok(());
         }
 
-        self.server.conn.flush().map_err(into_unknown)?;
-
-        let property: u32 = if success {
+        // on failure we notify the requester of it
+        let property = if success {
             event.property
         } else {
             AtomEnum::NONE.into()
         };
+        // tell the requestor that we finished sending data
         self.server
             .conn
             .send_event(
@@ -343,13 +355,7 @@ impl ClipboardContext {
             )
             .map_err(into_unknown)?;
 
-        self.server.conn.flush().map_err(into_unknown)?;
-
-        if event.target == self.atoms.UTF8_STRING {
-            println!("successfully written!");
-        }
-
-        Ok(())
+        self.server.conn.flush().map_err(into_unknown)
     }
 
     fn ask_clipboard_manager_to_request_our_data(&self) -> Result<()> {
@@ -358,19 +364,12 @@ impl ClipboardContext {
             error!("The server's window id was 0. This is unexpected");
             return Ok(());
         }
-        if self.data.read().is_none() {
-            // If we don't have any data, there's nothing to do.
+        if !self.is_owner()? {
+            // We are not owning the clipboard, nothing to do.
             return Ok(());
         }
-        let sel_owner = self
-            .server
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)
-            .map_err(into_unknown)?
-            .reply()
-            .map_err(into_unknown)?;
-        if sel_owner.owner != self.server.win_id {
-            // We are not owning the clipboard, nothing to do.
+        if self.data.read().is_none() {
+            // If we don't have any data, there's nothing to do.
             return Ok(());
         }
 
@@ -454,6 +453,11 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::e
         clip.handover_cv.notify_all();
     }
 
+    trace!("Started serve reqests thread.");
+
+    let mut written = false;
+    let mut notified = false;
+
     loop {
         match clipboard
             .server
@@ -467,6 +471,7 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::e
                 return Ok(());
             }
             Event::SelectionClear(event) => {
+                // TODO: check if this works
                 // Someone else has new content in the clipboard, so it is
                 // notifying us that we should delete our data now.
                 trace!("Somebody else owns the clipboard now");
@@ -476,24 +481,29 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::e
                 }
             }
             Event::SelectionRequest(event) => {
+                trace!(
+                    "{} - selection is: {}",
+                    line!(),
+                    clipboard.atom_name(event.selection)?
+                );
                 // Someone is requesting the clipboard content from us.
-                if let Err(e) = clipboard.handle_selection_request(event) {
-                    error!(
-                        "Received a `SelectionRequest`, but failed to handle it: {}",
-                        e
-                    );
-                } else if event.selection == clipboard.atoms.CLIPBOARD_MANAGER {
-                    println!("SelectionRequest from the clipboard manager");
-                    let handover_state = clipboard.handover_state.lock();
-                    if *handover_state == ManagerHandoverState::InProgress {
-                        clipboard.manager_written.store(true, Ordering::Relaxed);
-                        if clipboard.manager_notified.load(Ordering::Relaxed) {
-                            handover_finished(&clipboard, handover_state);
-                        }
+                clipboard
+                    .handle_selection_request(event)
+                    .map_err(into_unknown)?;
+
+                // if we are in the progress of saving to the clipboard manager
+                // make sure we save that we have finished writing
+                let handover_state = clipboard.handover_state.lock();
+                if *handover_state == ManagerHandoverState::InProgress {
+                    written = true;
+                    // if we have written and notified, make sure to notify that we are done
+                    if notified {
+                        handover_finished(&clipboard, handover_state);
                     }
                 }
             }
             Event::SelectionNotify(event) => {
+                trace!("{}", line!());
                 // We've requested the clipboard content and this is the
                 // answer. Considering that this thread is not responsible
                 // for reading clipboard contents, this must come from
@@ -503,10 +513,10 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::e
                     error!("Received a `SelectionNotify` from a selection other than the CLIPBOARD_MANAGER. This is unexpected in this thread.");
                     continue;
                 }
-                println!("SelectionNotify from the clipboard manager");
+                trace!("SelectionNotify from the clipboard manager");
                 let handover_state = clipboard.handover_state.lock();
                 if *handover_state == ManagerHandoverState::InProgress {
-                    clipboard.manager_notified.store(true, Ordering::Relaxed);
+                    notified = true;
 
                     // One would think that we could also finish if the property
                     // here is set 0, because that indicates failure. However
@@ -514,17 +524,20 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::e
                     // immediately get a SelectionNotify with property set to 0,
                     // but following that, we also get a valid SelectionRequest
                     // from the clipboard manager.
-                    if clipboard.manager_written.load(Ordering::Relaxed) {
+                    if written {
                         handover_finished(&clipboard, handover_state);
                     }
                 }
             }
+            // TODO: remove when we know more
             // We've requested the clipboard content and this is the
             // answer.
             Event::PropertyNotify(event) => {
-                println!("PropertyNotify: NOT YET IMPLEMENTED!");
+                info!("PropertyNotify: NOT YET IMPLEMENTED!");
             }
-            _ => (),
+            event @ _ => {
+                trace!("Received unexpected event: {:?}", event);
+            }
         }
     }
 }
@@ -534,6 +547,10 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
+    pub fn is_alive() -> bool {
+        THREAD_GUARD.load(Ordering::SeqCst)
+    }
+
     pub fn new() -> Result<Self> {
         // We are locking the global in write mode (exclusive)
         // to ensure that this is the invocation where we
@@ -587,12 +604,15 @@ impl Drop for Clipboard {
             // the global object, then we should destroy the global object,
             // and send the data to the clipboard manager
 
+            trace!("{}", line!());
+
             if let Err(e) = self.inner.ask_clipboard_manager_to_request_our_data() {
                 error!(
                     "Could not hand the clipboard data over to the clipboard manager: {}",
                     e
                 );
             }
+            trace!("{}", line!());
             if let Err(e) = self
                 .inner
                 .server
@@ -602,14 +622,18 @@ impl Drop for Clipboard {
                 error!("Failed to destroy the clipboard window. Error: {}", e);
                 return;
             }
+            trace!("{}", line!());
             if let Err(e) = self.inner.server.conn.flush() {
                 error!("Failed to flush the clipboard window. Error: {}", e);
                 return;
             }
+            trace!("{}", line!());
             if let Some(global_cb) = global_cb.take() {
+                trace!("{}", line!());
                 if let Err(_) = global_cb.server_handle.join() {
                     error!("The clipboard server thread paniced.");
                 }
+                trace!("{}", line!());
             }
         }
     }
