@@ -3,12 +3,14 @@ use log::{error, trace, warn};
 use once_cell::sync::Lazy;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use std::{
+    ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread::JoinHandle,
     time::Duration,
+    usize,
 };
 use x11rb::{
     connection::Connection,
@@ -32,10 +34,14 @@ fn into_unknown<E: std::error::Error>(err: E) -> Error {
     }
 }
 
+static THREAD_GUARD: AtomicBool = AtomicBool::new(false);
+
 // This is locked in write mode ONLY when the object is created and
 // destroyed. All the rest of the time, everyone is allowed to keep a
 // (const) reference to the inner `Arc<ClipboardInner>`, which saves a bunch of
 // locking and unwraping in code.
+
+// TODO THIS PROBABLY NEEDS TO BE A MUTEXT INSTEAD OF AN RW LOCK
 static CLIPBOARD: Lazy<RwLock<Option<GlobalClipboard>>> = Lazy::new(|| Default::default());
 
 x11rb::atom_manager! {
@@ -64,7 +70,7 @@ struct GlobalClipboard {
     context: Arc<ClipboardContext>,
 
     /// Join handle to the thread which serves selection requests.
-    server_handle: Option<JoinHandle<()>>,
+    server_handle: JoinHandle<()>,
 }
 
 struct XContext {
@@ -154,12 +160,15 @@ impl ClipboardContext {
         Ok(())
     }
 
-    fn read(&self) -> Result<Option<String>> {
+    fn read(&self) -> Result<String> {
         // if we are the current owner, we can get the current clipboard ourselves
-        if self.is_owner()? {
+        /*if self.is_owner()? {
             let data = self.data.read();
-            return Ok(data.clone());
+            return data.clone().ok_or(Error::ContentNotAvailable);
         }
+        if let Some(data) = self.data.read().clone() {
+            return Ok(data)
+        }*/
         let reader = XContext::new()?;
 
         trace!(
@@ -177,7 +186,7 @@ impl ClipboardContext {
                 self.atoms._BOOP,
                 Time::CURRENT_TIME,
             )
-            .map_err(|_| Error::ConversionFailure)?;
+            .map_err(into_unknown)?;
         reader.conn.flush().map_err(into_unknown)?;
 
         trace!("Finished `convert_selection`");
@@ -195,7 +204,7 @@ impl ClipboardContext {
 
                     // selection has no type = no selection present
                     if event.property == NONE {
-                        return Ok(None);
+                        return Err(Error::ContentNotAvailable);
                     }
 
                     // TODO: handle chunking
@@ -225,7 +234,7 @@ impl ClipboardContext {
                             let message = String::from_utf8(reply.value)
                                 .map_err(|_| Error::ConversionFailure)?;
 
-                            break Ok(Some(message));
+                            break Ok(message);
                         } else {
                             // this should never happen, we have sent a request only for supported types
                             break Err(Error::Unknown {
@@ -416,7 +425,22 @@ impl ClipboardContext {
     }
 }
 
-fn serve_requests(clipboard: Arc<ClipboardContext>) {
+struct ThreadGuard;
+
+impl ThreadGuard {
+    fn new() -> Self {
+        THREAD_GUARD.store(true, Ordering::SeqCst);
+        ThreadGuard
+    }
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        THREAD_GUARD.store(false, Ordering::SeqCst);
+    }
+}
+
+fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::error::Error>> {
     fn handover_finished(
         clip: &Arc<ClipboardContext>,
         mut handover_state: MutexGuard<ManagerHandoverState>,
@@ -431,22 +455,21 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) {
     }
 
     loop {
-        let event = match clipboard.server.conn.wait_for_event() {
-            Ok(event) => event,
-            Err(e) => {
-                error!("Failed to poll event for clipboard: {}", e);
-                return;
-            }
-        };
-        match event {
+        match clipboard
+            .server
+            .conn
+            .wait_for_event()
+            .map_err(into_unknown)?
+        {
             Event::DestroyNotify(_) => {
                 // This window is being destroyed.
-                return;
+                trace!("Clipboard server window is being destroyed");
+                return Ok(());
             }
             Event::SelectionClear(event) => {
                 // Someone else has new content in the clipboard, so it is
                 // notifying us that we should delete our data now.
-                println!("`SelectionClear`");
+                trace!("Somebody else owns the clipboard now");
                 if event.selection == clipboard.atoms.CLIPBOARD {
                     let mut data = clipboard.data.write();
                     *data = None;
@@ -512,19 +535,37 @@ pub struct Clipboard {
 
 impl Clipboard {
     pub fn new() -> Result<Self> {
-        println!("TODO: SAVE THE CLIPBOARD CONTEXT TO THE GLOBAL OBJECT");
-        let ctx = Arc::new(ClipboardContext::new()?);
-        {
-            let ctx = Arc::clone(&ctx);
-            std::thread::spawn(move || {
-                serve_requests(ctx);
+        // We are locking the global in write mode (exclusive)
+        // to ensure that this is the invocation where we
+        // initialize it if it doesn't exist.
+        let mut global_cb = CLIPBOARD.write();
+        if let Some(global_cb) = &*global_cb {
+            return Ok(Self {
+                inner: Arc::clone(&global_cb.context),
             });
         }
+        // At this point we know that the clipboard does not exists.
+        let ctx = Arc::new(ClipboardContext::new()?);
+        let join_handle;
+        {
+            let ctx = Arc::clone(&ctx);
+            join_handle = std::thread::spawn(move || {
+                let _guard = ThreadGuard::new();
+
+                if let Err(error) = serve_requests(ctx) {
+                    error!("Worker thread errored with: {}", error);
+                }
+            });
+        }
+        *global_cb = Some(GlobalClipboard {
+            context: Arc::clone(&ctx),
+            server_handle: join_handle,
+        });
         Ok(Self { inner: ctx })
     }
 
     pub fn read(&self) -> Result<String> {
-        self.inner.read()?.ok_or(Error::ContentNotAvailable)
+        self.inner.read()
     }
 
     pub fn write(&self, message: String) -> Result<()> {
@@ -534,13 +575,42 @@ impl Clipboard {
 
 impl Drop for Clipboard {
     fn drop(&mut self) {
-        println!("THE DROP TRAIT IS NOT YET IMPLEMENTED!");
-        if let Err(e) = self.inner.ask_clipboard_manager_to_request_our_data() {
-            error!(
-                "Could not hand the clipboard data over to the clipboard manager: {}",
-                e
-            );
+        // There are always at least 3 owners:
+        // the global, the server thread, and the `Clipboard::inner`
+        const MIN_OWNERS: usize = 3;
+
+        // We start with locking the global guard to prevent  race
+        // conditions below.
+        let mut global_cb = CLIPBOARD.write();
+        if Arc::strong_count(&self.inner) == MIN_OWNERS {
+            // If the are the only owers of the clipboard are ourselves and
+            // the global object, then we should destroy the global object,
+            // and send the data to the clipboard manager
+
+            if let Err(e) = self.inner.ask_clipboard_manager_to_request_our_data() {
+                error!(
+                    "Could not hand the clipboard data over to the clipboard manager: {}",
+                    e
+                );
+            }
+            if let Err(e) = self
+                .inner
+                .server
+                .conn
+                .destroy_window(self.inner.server.win_id)
+            {
+                error!("Failed to destroy the clipboard window. Error: {}", e);
+                return;
+            }
+            if let Err(e) = self.inner.server.conn.flush() {
+                error!("Failed to flush the clipboard window. Error: {}", e);
+                return;
+            }
+            if let Some(global_cb) = global_cb.take() {
+                if let Err(_) = global_cb.server_handle.join() {
+                    error!("The clipboard server thread paniced.");
+                }
+            }
         }
-        // self.conn.destroy_window(self.win_id).unwrap();
     }
 }

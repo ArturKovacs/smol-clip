@@ -16,6 +16,7 @@ x11rb = "0.8"
 
 [dev-dependencies]
 criterion = { version = "0.3", features = ["html_reports"] }
+simple_logger = "1"
 
 [profile.bench]
 codegen-units = 1

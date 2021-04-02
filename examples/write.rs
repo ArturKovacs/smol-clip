@@ -6,10 +6,15 @@ use std::{
 use anyhow::Result;
 use smol_clip::Clipboard;
 
+use simple_logger::SimpleLogger;
+
 fn main() -> Result<()> {
     // Test clipboard manager
+    let _logger = SimpleLogger::new().init().unwrap();
     let clipboard = Clipboard::new()?;
     clipboard.write("Hello Clipboard manager!".into())?;
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!("Hello Clipboard manager!", clipboard.read()?);
     return Ok(());
 
     let now = Instant::now();
