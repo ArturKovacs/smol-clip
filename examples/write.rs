@@ -12,10 +12,10 @@ fn main() -> Result<()> {
     // Test clipboard manager
     let _logger = SimpleLogger::new().init().unwrap();
     let clipboard = Clipboard::new()?;
-    clipboard.write("Hello Clipboard manager!".into())?;
+    clipboard.set_text("Hello Clipboard manager!".into())?;
     thread::sleep(Duration::from_secs(6));
     assert!(Clipboard::is_alive());
-    assert_eq!("Hello Clipboard manager!", clipboard.read()?);
+    assert_eq!("Hello Clipboard manager!", clipboard.get_text()?);
     return Ok(());
 
     let now = Instant::now();
@@ -26,11 +26,11 @@ fn main() -> Result<()> {
             i += 1;
             let text = format!("yoyo-{}", i);
             println!("\n-- Writing: '{}'", text);
-            clipboard.write(text.to_owned())?;
+            clipboard.set_text(text.to_owned())?;
 
             // thread::sleep(Duration::from_millis(100));
             // println!("\nReading");
-            assert_eq!(text, clipboard.read()?);
+            assert_eq!(text, clipboard.get_text()?);
             // println!("\nReading done");
         }
 
