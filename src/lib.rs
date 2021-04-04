@@ -272,8 +272,7 @@ impl ClipboardContext {
                                 // request the type that arrived
                                 event.target,
                                 0,
-                                // the length is corrected to X11 specifications by x11rb
-                                u32::MAX,
+                                u32::MAX / 4,
                             )
                             .map_err(into_unknown)?
                             .reply()
