@@ -41,8 +41,6 @@ fn into_unknown<E: std::error::Error>(err: E) -> Error {
     }
 }
 
-static THREAD_GUARD: AtomicBool = AtomicBool::new(false);
-
 // This is locked in write mode ONLY when the object is created and
 // destroyed. All the rest of the time, everyone is allowed to keep a
 // (const) reference to the inner `Arc<ClipboardInner>`, which saves a bunch of
@@ -111,6 +109,8 @@ struct ClipboardContext {
     data: RwLock<Option<ClipboardData>>,
     handover_state: Mutex<ManagerHandoverState>,
     handover_cv: Condvar,
+
+    serve_stopped: AtomicBool,
 }
 
 impl XContext {
@@ -180,10 +180,16 @@ impl ClipboardContext {
             data: RwLock::default(),
             handover_state: Mutex::new(ManagerHandoverState::Idle),
             handover_cv: Condvar::new(),
+            serve_stopped: AtomicBool::new(false),
         })
     }
 
     fn write(&self, data: ClipboardData) -> Result<()> {
+        if self.serve_stopped.load(Ordering::Relaxed) {
+            return Err(Error::Unknown {
+                description: "The clipboard handler thread seems to have stopped. Logging messages may reveal the cause. (See the `log` crate.)".into()
+            });
+        }
         // only if the current owner isn't us, we try to become it
         if !self.is_owner()? {
             let selection = self.atoms.CLIPBOARD;
@@ -627,18 +633,21 @@ impl ClipboardContext {
     }
 }
 
-struct ThreadGuard;
-
-impl ThreadGuard {
-    fn new() -> Self {
-        THREAD_GUARD.store(true, Ordering::SeqCst);
-        ThreadGuard
+struct ScopeGuard<F: FnOnce()> {
+    callback: Option<F>,
+}
+impl<F: FnOnce()> ScopeGuard<F> {
+    fn new(callback: F) -> Self {
+        ScopeGuard {
+            callback: Some(callback),
+        }
     }
 }
-
-impl Drop for ThreadGuard {
+impl<F: FnOnce()> Drop for ScopeGuard<F> {
     fn drop(&mut self) {
-        THREAD_GUARD.store(false, Ordering::SeqCst);
+        if let Some(callback) = self.callback.take() {
+            (callback)();
+        }
     }
 }
 
@@ -657,6 +666,10 @@ fn serve_requests(clipboard: Arc<ClipboardContext>) -> Result<(), Box<dyn std::e
     }
 
     trace!("Started serve reqests thread.");
+
+    let _guard = ScopeGuard::new(|| {
+        clipboard.serve_stopped.store(true, Ordering::Relaxed);
+    });
 
     let mut written = false;
     let mut notified = false;
@@ -752,10 +765,6 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub fn is_alive() -> bool {
-        THREAD_GUARD.load(Ordering::SeqCst)
-    }
-
     pub fn new() -> Result<Self> {
         let mut global_cb = CLIPBOARD.lock();
         if let Some(global_cb) = &*global_cb {
@@ -769,8 +778,6 @@ impl Clipboard {
         {
             let ctx = Arc::clone(&ctx);
             join_handle = std::thread::spawn(move || {
-                let _guard = ThreadGuard::new();
-
                 if let Err(error) = serve_requests(ctx) {
                     error!("Worker thread errored with: {}", error);
                 }
